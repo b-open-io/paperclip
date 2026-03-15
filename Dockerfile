@@ -58,4 +58,12 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+COPY --chmod=755 <<'ENTRYPOINT' /usr/local/bin/entrypoint.sh
+#!/bin/sh
+chown -R node:node /paperclip
+exec gosu node node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js
+ENTRYPOINT
+
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+
+CMD ["entrypoint.sh"]

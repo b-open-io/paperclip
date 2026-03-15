@@ -58,10 +58,5 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
-COPY --chmod=755 <<'ENTRYPOINT' /usr/local/bin/entrypoint.sh
-#!/bin/sh
-chown -R node:node /paperclip
-exec setpriv --reuid=node --regid=node --inh-caps=+net_raw,+net_bind_service --ambient-caps=+net_raw,+net_bind_service -- node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js
-ENTRYPOINT
-
-CMD ["entrypoint.sh"]
+USER node
+CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

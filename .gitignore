@@ -51,3 +51,5 @@ tests/release-smoke/playwright-report/
 .superset/
 bun.lock
 .claude/worktrees/
+packages/plugins/sdk/paperclipai-plugin-sdk-1.0.0.tgz
+packages/shared/paperclipai-shared-0.3.1.tgz

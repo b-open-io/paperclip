@@ -1,0 +1,242 @@
+═══════════════════════════════════════════════════════════════════════════════
+EXECUTIVE BRIEF: AIP SIGNATURE → BAP IDENTITY FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+RESEARCH OBJECTIVE
+─────────────────
+Determine the exact path from AIP (Author Identity Protocol) signer address to
+verified BAP (Bitcoin Attestation Protocol) identity in ClawNet skill publishing.
+
+FINDING: NO DIRECT PATH EXISTS
+─────────────────────────────
+
+The system uses TWO INDEPENDENT IDENTITY STREAMS:
+
+  STREAM 1: AIP SIGNATURE
+  ├─ Private Key (signing key from CLI config)
+  ├─ Process: AIP.sign(skillData)
+  ├─ Output: signerAddress (Bitcoin address)
+  └─ Current Use: Stored in database (not used for identity)
+
+  STREAM 2: USER AUTHENTICATION ← PRIMARY IDENTITY SOURCE
+  ├─ Identity Key (from BRC-100 wallet or Sigma Auth)
+  ├─ Process: BRC-31 header validation OR Sigma token verification
+  ├─ Output: authorBapId (via pubkeyToBapId or Sigma session)
+  └─ Current Use: Author identification in database
+
+These use DIFFERENT keys for DIFFERENT purposes.
+
+
+KEY INSIGHT
+──────────
+
+In /Users/satchmo/code/clawnet/app/api/v1/skills/route.ts (line 91):
+
+  const result = await getConvex().mutation(api.mutations.publishVersion, {
+    authorBapId: auth.bapId,  ← FROM AUTHENTICATION LAYER
+    aipSignature: payload.aipSignature,  ← FROM REQUEST (stored only)
+    signerAddress: payload.signerAddress,  ← FROM REQUEST (stored only)
+  });
+
+The server IGNORES signerAddress from the request and uses auth.bapId instead.
+
+This is by design: separates signing proof from identity claim.
+
+
+AUTHENTICATION SOURCES
+──────────────────────
+
+Option 1: BRC-31 (Preferred)
+├─ Extract: x-bsv-auth-identity-key header (66 hex chars)
+├─ Validate: ECDSA signature against BRC-43 derived keys
+├─ Derive: pubkeyToBapId(identityKey) → BAP ID
+└─ Result: { bapId, pubkey }
+
+Option 2: Sigma Bearer Token
+├─ Extract: Authorization: Bearer <token>
+├─ Validate: Call auth.sigmaidentity.com/api/auth/get-session
+├─ Derive: session.activeOrganizationId || user.pubkey
+└─ Result: { bapId, pubkey }
+
+
+DATA STORAGE
+────────────
+
+Convex Database:
+
+  skillVersions table:
+  ├─ authorBapId: "03xyz789abc..."    ← SOURCE: authentication layer
+  ├─ aipSignature: "base64..."        ← SOURCE: request payload
+  ├─ signerAddress: "1ABC123..."      ← SOURCE: request payload
+  └─ [Other skill metadata]
+
+  profiles table (cache):
+  ├─ bapId: "03xyz789abc..."
+  ├─ identity: {
+  │  ├─ alternateName: "Author Name"
+  │  ├─ image: "/txId_vout"
+  │  ├─ description: "Bio"
+  │  └─ ...
+  ├─ lastSeen: 1234567890
+  └─ ...
+
+
+PROFILE RESOLUTION
+──────────────────
+
+When rendering skill detail page:
+
+  1. Load skillVersions.authorBapId
+  2. Query Convex profiles table (cache)
+     └─ Cache HIT? Use stored profile
+     └─ Cache MISS? Fetch from Sigma API
+  3. Call: GET https://sigma.1sat.app/1sat/bap/profile/{bapId}
+  4. Response: { alternateName, image, description, ... }
+  5. Render: Author name, avatar, bio
+
+
+API CONTRACTS
+─────────────
+
+POST /api/v1/skills
+├─ Auth: BRC-31 headers OR Bearer token
+├─ Payload: { slug, name, files, aipSignature, signerAddress, ... }
+└─ Result: authorBapId = auth.bapId (from headers/token, not payload)
+
+GET https://sigma.1sat.app/1sat/bap/profile/{bapId}
+├─ Input: bapId (path parameter)
+├─ Success: { status: "OK", result: SigmaProfile }
+└─ Not Found: { message: "Profile not found..." }
+
+
+COMMON MISTAKES TO AVOID
+────────────────────────
+
+❌ Don't assume signerAddress = authorBapId
+   They come from different keys. No relationship expected.
+
+❌ Don't verify signerAddress against auth.pubkey
+   The signing key and identity key are intentionally separate.
+
+❌ Don't block publishing if BAP profile doesn't exist
+   Profiles are optional. User can create one later.
+
+❌ Don't use signerAddress for author identification
+   Always use authorBapId (from authentication layer).
+
+❌ Don't query Sigma API without caching
+   Profile data doesn't change frequently. Cache locally.
+
+
+CURRENT STATE
+─────────────
+
+✓ Skill signing (AIP) works and signature is stored
+✓ Author identity (BAP) properly assigned from auth layer
+✓ Profile resolution from Sigma API works
+✓ Caching of profiles in Convex works
+✓ Fallback to truncated BAP ID when profile not found
+
+⚠️ Signature is never verified (optional audit feature)
+⚠️ Signature is never displayed (could add "Signed by" badge)
+
+
+FUTURE ENHANCEMENTS
+───────────────────
+
+Optional additions that don't change core flow:
+
+1. Signature Verification Display
+   └─ Show "Signed by {signerAddress}" badge if signer ≠ author
+
+2. Signer Profile
+   └─ If signerAddress is also a BAP ID, show signer's profile too
+
+3. Audit Trail
+   └─ Display both author (authorBapId) and signer (signerAddress) publicly
+
+4. Multi-Signer Support
+   └─ Allow multiple signatures for collaborative skills
+
+
+TESTING CHECKLIST
+─────────────────
+
+□ Publish skill with BRC-31 auth
+  └─ Verify authorBapId matches authenticated user, not signerAddress
+
+□ Publish skill with Sigma Bearer token
+  └─ Verify authorBapId matches token's organization or user
+
+□ Fetch published skill
+  └─ Verify authorBapId is stored correctly
+
+□ Query Sigma API with authorBapId
+  └─ Verify profile is returned (or 404 if user has no on-chain profile)
+
+□ Load skill detail page
+  └─ Verify author name/avatar displayed correctly
+
+□ Query profile cache
+  └─ Verify Convex profiles table has entry for authorBapId
+
+
+FILES INVOLVED
+──────────────
+
+1. /Users/satchmo/code/clawnet/packages/cli/src/package/skill-tx.ts
+   └─ AIP signature generation (lines 35-111)
+
+2. /Users/satchmo/code/clawnet/app/api/v1/skills/route.ts
+   └─ Publish handler, authorBapId assignment (lines 45-126)
+
+3. /Users/satchmo/code/clawnet/lib/auth-middleware.ts
+   └─ Authentication context resolution (lines 46-173)
+
+4. /Users/satchmo/code/clawnet/lib/sigma.ts
+   └─ Sigma API integration (lines 21-35)
+
+5. /Users/satchmo/code/clawnet/app/skills/[slug]/page.tsx
+   └─ Skill display & profile rendering (lines 89-194)
+
+6. /Users/satchmo/code/clawnet/convex/schema.ts
+   └─ Database schema (skillVersions, profiles)
+
+
+DOCUMENTATION
+──────────────
+
+Complete research available in /Users/satchmo/code/paperclip/research/:
+
+├─ README.md                          [Start here]
+├─ RESEARCH-SUMMARY.md                [20 min overview]
+├─ AIP-to-BAP-identity-flow.md        [45 min detailed flow]
+├─ system-architecture.md             [Reference architecture]
+├─ data-flow-diagram.txt              [Visual diagrams]
+├─ implementation-reference.md        [Developer guide]
+└─ EXECUTIVE-BRIEF.txt                [This file]
+
+
+BOTTOM LINE
+───────────
+
+To go from AIP signerAddress → BAP identity:
+
+  1. AIP produces signerAddress ✓ (stored for audit)
+  2. Authentication layer produces authorBapId ✓ (primary identity)
+  3. authorBapId → Sigma API → profile { name, avatar, bio } ✓
+  4. Render skill with author info ✓
+
+NO DIRECT TRANSFORMATION from signerAddress to authorBapId.
+The authentication layer is the sole source of truth.
+
+This design allows:
+  • Different keys for different security domains
+  • Future delegated publishing (sign with one key, publish with another)
+  • Clear audit trail (who signed vs. who published)
+  • Flexible identity management (orgs, team members, etc.)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+Research completed: 2026-03-21 | Status: COMPLETE
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,263 @@
+═══════════════════════════════════════════════════════════════════════════════
+AIP SIGNATURE → BAP IDENTITY FLOW DIAGRAM
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 1: SKILL CREATION (CLI)                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+    User CLI Session
+           │
+           ├─ Reads: SKILL.md, package files, config
+           │
+           ├─ buildSkillOpReturn(fields, privateKey)
+           │  ├─ B protocol: Encode SKILL.md content
+           │  ├─ MAP protocol: Encode metadata (slug, version, description)
+           │  └─ AIP protocol: Sign with privateKey
+           │      ├─ Input: privateKey (SIGNING KEY, not identity key)
+           │      ├─ Process: ECDSA signature over B|MAP data
+           │      └─ Output: { signerAddress, aipSignature, opReturnHex }
+           │
+           └─ Publish Request to Server
+              ├─ Payload includes:
+              │  ├─ skill metadata (slug, name, description, version)
+              │  ├─ files (SKILL.md, etc.)
+              │  ├─ aipSignature (base64-encoded)
+              │  ├─ signerAddress (Bitcoin address)
+              │  └─ opReturnHex (OP_RETURN script hex)
+              │
+              └─ HTTP POST /api/v1/skills
+                 └─ Content-Type: application/json or multipart/form-data
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 2: SERVER AUTHENTICATION & IDENTITY RESOLUTION                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+    POST /api/v1/skills [with skill payload]
+           │
+           ├─ requireAuth(request)
+           │  │
+           │  ├─ PATH A: BRC-31 Header Authentication (Preferred)
+           │  │  ├─ Extract headers: x-bsv-auth-identity-key, x-bsv-auth-signature
+           │  │  ├─ Lookup session by yourNonce (server nonce)
+           │  │  ├─ Verify signature using BRC-43 derived keys
+           │  │  ├─ On success: Extract identityKey (compressed pubkey, 66 hex chars)
+           │  │  └─ Return AuthContext:
+           │  │     ├─ bapId = pubkeyToBapId(identityKey)  [derived from BAP lib]
+           │  │     └─ pubkey = identityKey
+           │  │
+           │  └─ PATH B: Sigma Bearer Token Authentication (Fallback)
+           │     ├─ Extract: Authorization: Bearer <token>
+           │     ├─ Call: https://auth.sigmaidentity.com/api/auth/get-session
+           │     ├─ On success: Extract user.pubkey + session.activeOrganizationId
+           │     └─ Return AuthContext:
+           │        ├─ bapId = session.activeOrganizationId || user.pubkey
+           │        └─ pubkey = user.pubkey
+           │
+           └─ AuthContext { bapId, pubkey } ← USER'S IDENTITY KEY
+
+
+    Parse Request Payload
+           │
+           ├─ Extract: aipSignature, signerAddress (from payload)
+           │            ↓
+           │            (These are stored but NOT used for identity!)
+           │
+           └─ Pass to Convex Mutation: publishVersion()
+
+
+    Convex Mutation: publishVersion(
+           │
+           ├─ Inputs:
+           │  ├─ slug, name, description, version
+           │  ├─ files, content (SKILL.md)
+           │  ├─ aipSignature, signerAddress, opReturnHex
+           │  └─ authorBapId ← FROM auth.bapId (AUTHENTICATION RESULT)
+           │
+           ├─ Create/Update skillVersions record:
+           │  {
+           │    slug,
+           │    version,
+           │    authorBapId,         ← PRIMARY IDENTITY SOURCE ✓
+           │    aipSignature,        ← Stored for reference (not used for identity)
+           │    signerAddress,       ← Stored for reference (not used for identity)
+           │    content,
+           │    publishedAt,
+           │    ...
+           │  }
+           │
+           └─ Return: { slug, version }
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 3: DISPLAY & PROFILE RESOLUTION                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+    GET /skills/my-skill [user visiting skill detail page]
+           │
+           ├─ Load from Convex:
+           │  ├─ skill { slug, name, description, authorBapId, ... }
+           │  └─ skillVersions { content, aipSignature, signerAddress, ... }
+           │
+           └─ Lookup author profile in Convex:
+              │
+              ├─ SELECT FROM profiles WHERE bapId = skill.authorBapId
+              │  │
+              │  ├─ Cache HIT: Profile found locally
+              │  │  └─ Use cached { alternateName, image, description, ... }
+              │  │
+              │  └─ Cache MISS: No profile in Convex
+              │     │
+              │     └─ Call Sigma API:
+              │        │
+              │        └─ GET https://sigma.1sat.app/1sat/bap/profile/{bapId}
+              │           │
+              │           ├─ Query Parameter: bapId (BAP identity key)
+              │           │
+              │           └─ Response (if found):
+              │              {
+              │                "status": "OK",
+              │                "result": {
+              │                  "@context": "https://schema.org",
+              │                  "@type": "Person",
+              │                  "alternateName": "Author Name",
+              │                  "image": "/txId_vout" or "/relative/path",
+              │                  "banner": "/txId_vout",
+              │                  "description": "Author bio",
+              │                  "paymail": "name@example.com",
+              │                  "url": "https://..."
+              │                }
+              │              }
+              │
+              └─ Resolve image paths:
+                 │
+                 ├─ If image starts with "_":
+                 │  └─ Expand using txId from profile.txHash or last address
+                 │     └─ Example: "_0" → "/txId_0"
+                 │
+                 └─ Convert to ORDFS gateway URL:
+                    └─ "https://ordfs.network/{txId}_{vout}"
+
+
+    Render Skill Detail Page
+           │
+           ├─ Author sidebar section:
+           │  ├─ Avatar image: <img src="https://ordfs.network/..." />
+           │  ├─ Author name: profile.alternateName or truncated(bapId)
+           │  ├─ Description: profile.description
+           │  └─ Link: /profile/{bapId}
+           │
+           ├─ Status badge:
+           │  ├─ ✓ On-chain (if skillVersion.onChain = true)
+           │  ├─ ✓ Signed (if skillVersion.aipSignature exists)
+           │  └─ Note: signerAddress NOT displayed (could be added as audit feature)
+           │
+           └─ Trust & attestation sections:
+              ├─ Fetch auditor profiles similarly (by auditorBapId)
+              ├─ Display web of trust
+              └─ Show attestation verdicts
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ KEY DATA TRANSFORMATIONS                                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+1. SIGNING KEY → signerAddress (AIP Protocol)
+   ┌──────────────────────────────┐
+   │ privateKey (from CLI config) │  ← Skill signing key
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ AIP.sign(data, signer)       │
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ signerAddress (Bitcoin addr) │  ← Derived from signing key pubkey
+   └──────────────────────────────┘
+            ↓
+   Stored in skillVersions.signerAddress (reference only)
+
+
+2. IDENTITY KEY → BAP ID (Authentication)
+   ┌──────────────────────────────┐
+   │ BRC-31 header OR Sigma token │  ← User's authenticated session
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ Extract identityKey (pubkey) │  ← User's BRC-100 identity key
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ pubkeyToBapId(identityKey)   │  ← BAP library function
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ authorBapId (BAP ID)         │  ← User's BAP identity
+   └──────────────────────────────┘
+            ↓
+   Stored in skillVersions.authorBapId (PRIMARY IDENTITY)
+
+
+3. BAP ID → Profile (Resolution)
+   ┌──────────────────────────────┐
+   │ authorBapId (BAP ID)         │
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ Sigma API GET /bap/profile/{} │
+   └──────────────────────────────┘
+            ↓
+   ┌──────────────────────────────┐
+   │ SigmaProfile {               │
+   │   alternateName,             │
+   │   image,                     │
+   │   description,               │
+   │   ...                        │
+   │ }                            │
+   └──────────────────────────────┘
+            ↓
+   Displayed on skill page
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ CRITICAL RELATIONSHIPS                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+⚠️  signerAddress ≠ authorBapId
+    • signerAddress comes from SIGNING KEY (AIP protocol)
+    • authorBapId comes from AUTHENTICATION LAYER (BRC-31/Sigma)
+    • These are DIFFERENT keys with DIFFERENT purposes
+
+✓   authorBapId is the ONLY identity source
+    • Used to credit authorship in database
+    • Used to lookup profile information
+    • Used to resolve author name, avatar, etc.
+    • Verified through BRC-31 or Sigma Auth
+
+✓   signerAddress can optionally verify cryptographic proof
+    • Stored for audit purposes
+    • Could be displayed as "Signed by: {address}"
+    • Allows users to verify AIP signature authenticity
+    • NOT currently used in ClawNet flow
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ API ENDPOINTS SUMMARY                                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+PUBLISH SKILL
+  POST https://clawnet.app/api/v1/skills
+  Headers: BRC-31 auth OR Authorization: Bearer <token>
+  Body: JSON with skill data + aipSignature + signerAddress + opReturnHex
+  Returns: { ok: true, slug: string, version: string }
+
+GET SKILL
+  GET https://clawnet.app/api/v1/skills/{slug}
+  Returns: Skill with authorBapId
+
+GET BAP PROFILE
+  GET https://sigma.1sat.app/1sat/bap/profile/{bapId}
+  Returns: { status: "OK", result: SigmaProfile }
+
+═══════════════════════════════════════════════════════════════════════════════
